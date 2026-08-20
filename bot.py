@@ -17,8 +17,8 @@ except FileNotFoundError:
     exit(1)
 
 # Spotify API credentials (lấy từ https://developer.spotify.com/dashboard)
-SPOTIFY_CLIENT_ID = "your_client_id_here"
-SPOTIFY_CLIENT_SECRET = "your_client_secret_here"
+SPOTIFY_CLIENT_ID = "your_client_id_here"       # <- Thay vào đây
+SPOTIFY_CLIENT_SECRET = "your_client_secret_here" # <- Thay vào đây
 
 # Prefix cho bot
 PREFIX = "?"
@@ -106,15 +106,14 @@ def search_spotify(query):
     return None
 
 def search_youtube(query):
-    """Tìm kiếm trên YouTube - dùng cookies từ trình duyệt thay vì file"""
+    """Tìm kiếm trên YouTube"""
     try:
         ydl_opts = {
             'format': 'bestaudio/best',
             'quiet': True,
             'no_warnings': True,
             'extract_flat': True,
-            # 🔥 Dùng cookies từ trình duyệt Chrome (đổi thành 'firefox' nếu xài Firefox)
-            'cookiesfrombrowser': ('chrome',),
+            'cookiefile': 'cookies.txt',
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -129,7 +128,7 @@ def search_youtube(query):
     return None
 
 async def download_and_cache(url, track_name):
-    """Tải nhạc về cache - dùng cookies từ trình duyệt"""
+    """Tải nhạc về cache"""
     try:
         safe_name = re.sub(r'[^\w\s-]', '', track_name)[:50]
         filename = f"audio_cache/{safe_name.replace(' ', '_')}.mp3"
@@ -145,8 +144,7 @@ async def download_and_cache(url, track_name):
                 'outtmpl': f'audio_cache/{safe_name.replace(" ", "_")}',
                 'quiet': True,
                 'no_warnings': True,
-                # 🔥 Không dùng cookiefile nữa, dùng cookies từ trình duyệt
-                'cookiesfrombrowser': ('chrome',),
+                'cookiefile': 'cookies.txt',
                 'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -195,7 +193,6 @@ async def on_ready():
     print(f"✅ Bot đã đăng nhập: {bot.user}")
     print(f"📌 Prefix: {PREFIX}")
     print("🎵 Spotify + YouTube mode ready!")
-    print("🍪 Sử dụng cookies từ trình duyệt (Chrome) – không cần file cookies.txt")
 
 # ===== COMMANDS =====
 @bot.command(name="join")
@@ -256,7 +253,7 @@ async def play(ctx, *, query: str = None):
             await ctx.send(f"✅ Đã thêm {len(spotify_tracks)} bài từ Spotify!")
         elif is_youtube_url(query):
             await ctx.send("🔴 Đang tải link YouTube...")
-            ydl_opts = {'quiet': True, 'no_warnings': True, 'cookiesfrombrowser': ('chrome',)}
+            ydl_opts = {'quiet': True, 'no_warnings': True, 'cookiefile': 'cookies.txt'}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(query, download=False)
                 track_name = info['title']
