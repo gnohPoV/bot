@@ -1,396 +1,511 @@
+"""
+SPOTIFY CONNECT BOT - Single File
+==================================
+Bot giả làm 1 thiết bị Spotify Connect. Khi bạn mở app Spotify và
+bấm "Connect to a device" → chọn "Discord Bot", audio sẽ phát lên voice.
+
+Setup:
+1. Cài librespot:
+   - Windows: tải librespot.exe từ
+     https://github.com/librespot-org/librespot/releases
+     đặt cùng thư mục bot
+   - Linux:   cargo install librespot  (hoặc tải binary)
+   - Mac:     brew install librespot
+2. Có Spotify Premium (bắt buộc cho Connect API)
+3. pip install discord.py
+
+Chạy:
+    py bot.py
+
+Sử dụng trên Discord:
+    ?join             - Bot vào voice channel
+    ?spotify-start    - Bật Spotify Connect (lần đầu cần login)
+    ?spotify-stop     - Tắt
+    ?spotify-status   - Trạng thái
+    ?help             - Hướng dẫn
+
+Lần đầu chạy ?spotify-start:
+    - Terminal sẽ hiển thị link đăng nhập Spotify
+    - Mở link, đăng nhập, cấp quyền
+    - Credentials được cache vào ./.spotify-cache
+    - Các lần sau tự đăng nhập
+"""
+
 import discord
 from discord.ext import commands
-import yt_dlp
 import asyncio
 import os
-import re
-import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials
+import sys
+import json
+import subprocess
+import shutil
+import threading
+import queue
+import logging
+from pathlib import Path
 
-# ===== CONFIGURATION =====
-# Đọc token Discord từ file
+# ===== LOGGING =====
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+
+# =====================================================================
+# CONFIG
+# =====================================================================
+CONFIG_FILE = "config.json"
+default_config = {
+    "default_prefix": "?",
+    "admin_ids": [],
+    "spotify_device_name": "Discord Bot",
+    "spotify_bitrate": 320,
+    "spotify_cache_dir": "./.spotify-cache"
+}
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(default_config, f, indent=2, ensure_ascii=False)
+    logger.info(f"⚠️ Đã tạo file {CONFIG_FILE} mặc định.")
+    return default_config
+
+config = load_config()
+DEFAULT_PREFIX = config.get("default_prefix", "?")
+ADMIN_IDS = config.get("admin_ids", [])
+DEVICE_NAME = config.get("spotify_device_name", "Discord Bot")
+BITRATE = config.get("spotify_bitrate", 320)
+CACHE_DIR = config.get("spotify_cache_dir", "./.spotify-cache")
+
+
+# ===== ĐỌC TOKEN DISCORD =====
 try:
     with open('discord_token.txt', 'r') as f:
         DISCORD_TOKEN = f.read().strip()
+        if not DISCORD_TOKEN:
+            raise ValueError("Token rỗng")
 except FileNotFoundError:
-    print("❌ Không tìm thấy file discord_token.txt! Tạo file và paste token vào.")
-    exit(1)
+    logger.error("❌ Không tìm thấy discord_token.txt!")
+    sys.exit(1)
+except ValueError as e:
+    logger.error(f"❌ Lỗi token Discord: {e}")
+    sys.exit(1)
 
-# Spotify API credentials (lấy từ https://developer.spotify.com/dashboard)
-SPOTIFY_CLIENT_ID = "your_client_id_here"       # <- Thay vào đây
-SPOTIFY_CLIENT_SECRET = "your_client_secret_here" # <- Thay vào đây
 
-# Prefix cho bot
-PREFIX = "?"
+# =====================================================================
+# TÌM LIBRESPOT
+# =====================================================================
+def find_librespot():
+    """Tìm librespot trong PATH hoặc cùng thư mục bot."""
+    # Cùng thư mục bot
+    for name in ["librespot.exe", "librespot"]:
+        local = Path(name)
+        if local.exists():
+            return str(local.resolve())
+    # Trong PATH
+    found = shutil.which("librespot")
+    if found:
+        return found
+    return None
 
-# ===== INIT =====
+LIBRESPOT_PATH = find_librespot()
+
+
+# =====================================================================
+# SPOTIFY AUDIO SOURCE
+# =====================================================================
+class SpotifyAudioSource(discord.AudioSource):
+    """
+    Đọc PCM từ librespot → chuyển qua ffmpeg → đẩy lên Discord.
+    Discord cần PCM 16-bit stereo 48kHz, mỗi frame 20ms = 3840 bytes.
+    """
+    FRAME_SIZE = 3840  # 0.02s * 48000Hz * 2ch * 2bytes
+
+    def __init__(self, device_name: str, bitrate: int):
+        self.device_name = device_name
+        self.bitrate = bitrate
+        self.librespot = None
+        self.ffmpeg = None
+        self.buffer = queue.Queue(maxsize=100)
+        self.running = False
+        self.reader_thread = None
+
+    def start(self):
+        """Khởi động librespot + ffmpeg + reader thread."""
+        if not LIBRESPOT_PATH:
+            raise RuntimeError("Không tìm thấy librespot. Cài đặt và đặt cùng thư mục bot.")
+
+        os.makedirs(CACHE_DIR, exist_ok=True)
+
+        logger.info(f"🎵 Khởi động librespot (device: {self.device_name}, bitrate: {self.bitrate})")
+
+        # ----- librespot: output PCM ra stdout -----
+        librespot_cmd = [
+            LIBRESPOT_PATH,
+            "--name", self.device_name,
+            "--backend", "pipe",
+            "--bitrate", str(self.bitrate),
+            "--cache", CACHE_DIR,
+            "--disable-discovery"  # tắt mDNS (tuỳ chọn, giảm nhiễu)
+        ]
+        self.librespot = subprocess.Popen(
+            librespot_cmd,
+            stdout=subprocess.PIPE,
+            stderr=None  # để auth prompt hiện trong terminal
+        )
+        logger.info(f"   librespot PID: {self.librespot.pid}")
+
+        # ----- ffmpeg: PCM in → PCM S16LE 48kHz stereo out -----
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-i", "pipe:0",
+            "-f", "s16le",
+            "-ar", "48000",
+            "-ac", "2",
+            "pipe:1"
+        ]
+        self.ffmpeg = subprocess.Popen(
+            ffmpeg_cmd,
+            stdin=self.librespot.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL
+        )
+        logger.info(f"   ffmpeg PID: {self.ffmpeg.pid}")
+
+        # ----- Reader thread: đọc ffmpeg stdout → buffer -----
+        self.running = True
+        self.reader_thread = threading.Thread(
+            target=self._reader_loop,
+            name="SpotifyReader",
+            daemon=True
+        )
+        self.reader_thread.start()
+
+        logger.info("✅ Spotify source sẵn sàng. Mở app Spotify → Connect to a device!")
+
+    def _reader_loop(self):
+        """Đọc liên tục từ ffmpeg stdout, đẩy vào queue."""
+        while self.running:
+            try:
+                data = self.ffmpeg.stdout.read(self.FRAME_SIZE)
+                if not data or len(data) < self.FRAME_SIZE:
+                    logger.warning("⚠️ ffmpeg stream kết thúc")
+                    break
+                try:
+                    self.buffer.put(data, timeout=0.1)
+                except queue.Full:
+                    # Bỏ frame nếu buffer đầy (tránh tích tụ)
+                    pass
+            except Exception as e:
+                logger.error(f"Reader error: {e}")
+                break
+
+    def read(self) -> bytes:
+        """Discord.py gọi liên tục để lấy 20ms PCM."""
+        # Nếu librespot đã chết → kết thúc
+        if self.librespot and self.librespot.poll() is not None:
+            return b''
+        if not self.running:
+            return b''
+
+        try:
+            return self.buffer.get(timeout=0.02)
+        except queue.Empty:
+            # Không có data (Spotify paused hoặc chưa phát) → trả silence
+            return b'\x00' * self.FRAME_SIZE
+
+    def cleanup(self):
+        """Dọn dẹp khi dừng."""
+        self.running = False
+        if self.reader_thread:
+            self.reader_thread.join(timeout=1)
+
+        for proc, name in [(self.ffmpeg, "ffmpeg"), (self.librespot, "librespot")]:
+            if proc and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=3)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                logger.info(f"🛑 Đã dừng {name}")
+
+
+# =====================================================================
+# BOT SETUP
+# =====================================================================
+def get_prefix(bot, message):
+    return DEFAULT_PREFIX
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
-bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+intents.members = True
 
-# Tạo thư mục cache
-if not os.path.exists('audio_cache'):
-    os.makedirs('audio_cache')
+bot = commands.Bot(command_prefix=get_prefix, intents=intents, help_command=None)
+bot.remove_command('help')
 
-# Khởi tạo Spotify client
-sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
-    client_id=SPOTIFY_CLIENT_ID,
-    client_secret=SPOTIFY_CLIENT_SECRET
-))
+# Lưu source theo guild để cleanup
+active_sources = {}  # guild_id -> SpotifyAudioSource
 
-# Lưu queue
-music_queues = {}
 
-def get_queue(guild_id):
-    if guild_id not in music_queues:
-        music_queues[guild_id] = {'queue': [], 'current': None}
-    return music_queues[guild_id]
+def is_admin(ctx):
+    return ctx.author.id in ADMIN_IDS
 
-# ===== UTILITY FUNCTIONS =====
-def is_spotify_url(url):
-    return 'open.spotify.com' in url or 'spotify.com' in url
 
-def is_youtube_url(url):
-    return 'youtube.com' in url.lower() or 'youtu.be' in url.lower()
+# =====================================================================
+# COMMANDS
+# =====================================================================
 
-def get_spotify_track_info(url):
-    """Lấy thông tin track từ Spotify URL"""
-    try:
-        if 'track' in url:
-            track = sp.track(url)
-            return [{
-                'name': f"{track['name']} - {track['artists'][0]['name']}",
-                'query': f"{track['name']} {track['artists'][0]['name']} audio"
-            }]
-        elif 'playlist' in url:
-            playlist_id = url.split('/')[-1].split('?')[0]
-            results = sp.playlist_tracks(playlist_id)
-            tracks = []
-            for item in results['items']:
-                track = item['track']
-                if track:
-                    tracks.append({
-                        'name': f"{track['name']} - {track['artists'][0]['name']}",
-                        'query': f"{track['name']} {track['artists'][0]['name']} audio"
-                    })
-            return tracks
-        elif 'album' in url:
-            album_id = url.split('/')[-1].split('?')[0]
-            album_info = sp.album(url)
-            artist_name = album_info['artists'][0]['name']
-            results = sp.album_tracks(album_id)
-            tracks = []
-            for track in results['items']:
-                tracks.append({
-                    'name': f"{track['name']} - {artist_name}",
-                    'query': f"{track['name']} {artist_name} audio"
-                })
-            return tracks
-    except Exception as e:
-        print(f"Spotify error: {e}")
-    return []
-
-def search_spotify(query):
-    """Tìm kiếm trên Spotify"""
-    try:
-        results = sp.search(q=query, type='track', limit=5)
-        if results['tracks']['items']:
-            track = results['tracks']['items'][0]
-            return {
-                'name': f"{track['name']} - {track['artists'][0]['name']}",
-                'query': f"{track['name']} {track['artists'][0]['name']} audio"
-            }
-    except Exception as e:
-        print(f"Spotify search error: {e}")
-    return None
-
-def search_youtube(query):
-    """Tìm kiếm trên YouTube"""
-    try:
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': True,
-            'cookiefile': 'cookies.txt',
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch:{query}", download=False)
-            if info and info['entries']:
-                return {
-                    'name': info['entries'][0]['title'],
-                    'url': f"https://www.youtube.com/watch?v={info['entries'][0]['id']}"
-                }
-    except Exception as e:
-        print(f"YouTube search error: {e}")
-    return None
-
-async def download_and_cache(url, track_name):
-    """Tải nhạc về cache"""
-    try:
-        safe_name = re.sub(r'[^\w\s-]', '', track_name)[:50]
-        filename = f"audio_cache/{safe_name.replace(' ', '_')}.mp3"
-        if not os.path.exists(filename):
-            print(f"⬇️ Đang cache: {safe_name}")
-            ydl_opts = {
-                'format': 'bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-                'outtmpl': f'audio_cache/{safe_name.replace(" ", "_")}',
-                'quiet': True,
-                'no_warnings': True,
-                'cookiefile': 'cookies.txt',
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.extract_info(url, download=True)
-            print(f"✓ Cache xong: {safe_name}")
-    except Exception as e:
-        print(f"Cache error: {e}")
-
-async def play_audio(ctx, track_name):
-    """Phát nhạc từ cache"""
-    try:
-        safe_name = re.sub(r'[^\w\s-]', '', track_name)[:50]
-        filename = f"audio_cache/{safe_name.replace(' ', '_')}.mp3"
-        waited = 0
-        while not os.path.exists(filename) and waited < 60:
-            await asyncio.sleep(0.5)
-            waited += 0.5
-        if not os.path.exists(filename):
-            await ctx.send(f"❌ Không thể tải: {track_name}")
-            return
-        source = discord.FFmpegOpusAudio(filename)
-        def after_playing(error):
-            if error:
-                print(f"Playback error: {error}")
-            asyncio.run_coroutine_threadsafe(play_next_track(ctx), bot.loop)
-        ctx.voice_client.play(source, after=after_playing)
-    except Exception as e:
-        print(f"Playback error: {e}")
-        await ctx.send(f"❌ Lỗi phát nhạc: {e}")
-
-async def play_next_track(ctx):
-    """Phát bài tiếp theo trong queue"""
-    queue = get_queue(ctx.guild.id)
-    if not queue['queue']:
-        queue['current'] = None
-        return
-    track = queue['queue'].pop(0)
-    queue['current'] = track
-    await ctx.send(f"🎵 **Đang phát:** {track['name']}")
-    asyncio.create_task(download_and_cache(track['youtube_url'], track['name']))
-    await play_audio(ctx, track['name'])
-
-# ===== BOT EVENTS =====
-@bot.event
-async def on_ready():
-    print(f"✅ Bot đã đăng nhập: {bot.user}")
-    print(f"📌 Prefix: {PREFIX}")
-    print("🎵 Spotify + YouTube mode ready!")
-
-# ===== COMMANDS =====
 @bot.command(name="join")
 async def join(ctx):
-    """Tham gia voice channel"""
-    if ctx.author.voice is None:
-        await ctx.send("❌ Bạn phải ở trong voice channel!")
+    """Bot vào voice channel."""
+    if not ctx.author.voice:
+        await ctx.send("❌ Bạn chưa vào voice!")
         return
-    channel = ctx.author.voice.channel
+    if ctx.voice_client:
+        await ctx.send("✅ Bot đã ở trong voice rồi.")
+        return
     try:
-        await channel.connect()
-        await ctx.send(f"✅ Đã vào kênh: {channel.name}")
+        await ctx.author.voice.channel.connect()
+        await ctx.send(f"✅ Đã vào {ctx.author.voice.channel.mention}")
     except Exception as e:
         await ctx.send(f"❌ Lỗi: {e}")
+
 
 @bot.command(name="leave")
 async def leave(ctx):
-    """Rời voice channel"""
-    if ctx.voice_client is None:
-        await ctx.send("❌ Bot không ở trong voice channel")
-        return
-    if ctx.voice_client.is_playing():
-        ctx.voice_client.stop()
-    queue = get_queue(ctx.guild.id)
-    queue['queue'] = []
-    queue['current'] = None
-    await ctx.voice_client.disconnect()
-    await ctx.send("👋 Đã rời kênh voice")
-
-@bot.command(name="play")
-async def play(ctx, *, query: str = None):
-    """Phát nhạc từ Spotify hoặc YouTube"""
-    if query is None:
-        await ctx.send("❌ Cách dùng: ?play <tên bài hát hoặc link>")
-        return
-    if ctx.voice_client is None:
-        if ctx.author.voice is None:
-            await ctx.send("❌ Bạn phải ở trong voice channel!")
-            return
-        channel = ctx.author.voice.channel
-        await channel.connect()
-        await ctx.send(f"✅ Đã vào kênh: {channel.name}")
-    try:
-        if is_spotify_url(query):
-            await ctx.send("🟢 Đang tải từ Spotify...")
-            spotify_tracks = get_spotify_track_info(query)
-            if not spotify_tracks:
-                await ctx.send("❌ Không lấy được track từ Spotify")
-                return
-            for spotify_track in spotify_tracks:
-                youtube_result = search_youtube(spotify_track['query'])
-                if youtube_result:
-                    queue = get_queue(ctx.guild.id)
-                    queue['queue'].append({
-                        'name': spotify_track['name'],
-                        'youtube_url': youtube_result['url']
-                    })
-            await ctx.send(f"✅ Đã thêm {len(spotify_tracks)} bài từ Spotify!")
-        elif is_youtube_url(query):
-            await ctx.send("🔴 Đang tải link YouTube...")
-            ydl_opts = {'quiet': True, 'no_warnings': True, 'cookiefile': 'cookies.txt'}
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(query, download=False)
-                track_name = info['title']
-            queue = get_queue(ctx.guild.id)
-            queue['queue'].append({
-                'name': track_name,
-                'youtube_url': query
-            })
-            await ctx.send(f"✅ Đã thêm: **{track_name}**")
-        else:
-            await ctx.send("🔍 Đang tìm kiếm...")
-            spotify_result = search_spotify(query)
-            if spotify_result:
-                search_query = spotify_result['query']
-                track_name = spotify_result['name']
-            else:
-                search_query = query
-                track_name = None
-            youtube_result = search_youtube(search_query)
-            if not youtube_result:
-                await ctx.send("❌ Không tìm thấy kết quả")
-                return
-            if not track_name:
-                track_name = youtube_result['name']
-            queue = get_queue(ctx.guild.id)
-            queue['queue'].append({
-                'name': track_name,
-                'youtube_url': youtube_result['url']
-            })
-            await ctx.send(f"✅ Đã thêm: **{track_name}**")
-        if not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused():
-            await play_next_track(ctx)
-    except Exception as e:
-        await ctx.send(f"❌ Lỗi: {str(e)}")
-        print(f"Play error: {e}")
-
-@bot.command(name="spotify")
-async def spotify_search(ctx, *, query: str = None):
-    """Tìm kiếm trên Spotify"""
-    if query is None:
-        await ctx.send("❌ Cách dùng: ?spotify <tên bài hát>")
-        return
-    try:
-        results = sp.search(q=query, type='track', limit=5)
-        if not results['tracks']['items']:
-            await ctx.send("❌ Không tìm thấy trên Spotify")
-            return
-        response = "🟢 **Kết quả Spotify:**\n"
-        for i, track in enumerate(results['tracks']['items'][:5], 1):
-            artists = ", ".join([artist['name'] for artist in track['artists']])
-            response += f"{i}. **{track['name']}** - {artists}\n"
-        response += "\nGõ `?play <tên bài>` để phát"
-        await ctx.send(response)
-    except Exception as e:
-        await ctx.send(f"❌ Lỗi: {e}")
-
-@bot.command(name="queue")
-async def queue_cmd(ctx):
-    """Xem hàng đợi"""
-    queue = get_queue(ctx.guild.id)
-    queue_text = ""
-    if queue['current']:
-        queue_text += f"🎵 **Đang phát:** {queue['current']['name']}\n\n"
-    if queue['queue']:
-        queue_text += "📋 **Tiếp theo:**\n"
-        for i, track in enumerate(queue['queue'][:10], 1):
-            queue_text += f"{i}. {track['name']}\n"
-        if len(queue['queue']) > 10:
-            queue_text += f"... và {len(queue['queue']) - 10} bài nữa"
-    else:
-        queue_text += "📋 Hàng đợi trống"
-    await ctx.send(queue_text)
-
-@bot.command(name="skip")
-async def skip(ctx):
-    """Bỏ qua bài hiện tại"""
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        ctx.voice_client.stop()
-        await ctx.send("⏭️ Đã bỏ qua")
-    else:
-        await ctx.send("❌ Không có bài nào đang phát")
-
-@bot.command(name="stop")
-async def stop(ctx):
-    """Dừng và xóa hàng đợi"""
-    queue = get_queue(ctx.guild.id)
-    queue['queue'] = []
-    queue['current'] = None
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        ctx.voice_client.stop()
-    await ctx.send("⏹️ Đã dừng")
-
-@bot.command(name="pause")
-async def pause(ctx):
-    """Tạm dừng / Tiếp tục"""
+    """Bot rời voice (tự dừng stream)."""
     if not ctx.voice_client:
-        await ctx.send("❌ Bot không ở trong voice")
+        await ctx.send("❌ Bot chưa ở voice.")
         return
+
+    # Dọn source
+    src = active_sources.pop(ctx.guild.id, None)
+    if src:
+        src.cleanup()
+
     if ctx.voice_client.is_playing():
-        ctx.voice_client.pause()
-        await ctx.send("⏸️ Đã tạm dừng")
-    elif ctx.voice_client.is_paused():
-        ctx.voice_client.resume()
-        await ctx.send("▶️ Tiếp tục phát")
+        ctx.voice_client.stop()
+    await ctx.voice_client.disconnect()
+    await ctx.send("👋 Đã rời voice.")
 
-@bot.command(name="commands")
-async def commands_cmd(ctx):
-    """Hiển thị danh sách lệnh"""
+
+@bot.command(name="spotify-start", aliases=["spotifystart", "sstart"])
+async def spotify_start(ctx):
+    """Bật Spotify Connect device và stream lên Discord voice."""
+    if not LIBRESPOT_PATH:
+        await ctx.send(
+            "❌ Không tìm thấy **librespot**.\n"
+            "📥 Tải tại: https://github.com/librespot-org/librespot/releases\n"
+            "📁 Đặt `librespot.exe` (Windows) hoặc `librespot` (Linux/Mac) cùng thư mục bot."
+        )
+        return
+
+    # Cần ở trong voice
+    if not ctx.author.voice:
+        await ctx.send("❌ Bạn phải ở trong voice channel trước!")
+        return
+
+    # Vào voice nếu chưa
+    if not ctx.voice_client:
+        try:
+            await ctx.author.voice.channel.connect()
+            await ctx.send(f"✅ Đã vào {ctx.author.voice.channel.mention}")
+        except Exception as e:
+            await ctx.send(f"❌ Không vào được voice: {e}")
+            return
+
+    # Nếu đã có stream → dừng trước
+    if ctx.guild.id in active_sources:
+        old = active_sources.pop(ctx.guild.id)
+        old.cleanup()
+        if ctx.voice_client.is_playing():
+            ctx.voice_client.stop()
+            await asyncio.sleep(0.5)
+
+    try:
+        # Tạo source
+        source = SpotifyAudioSource(DEVICE_NAME, BITRATE)
+        source.start()
+        active_sources[ctx.guild.id] = source
+
+        def after_playing(error):
+            if error:
+                logger.error(f"[Spotify] Playback error: {error}")
+            # Cleanup khi stream kết thúc
+            src = active_sources.pop(ctx.guild.id, None)
+            if src:
+                src.cleanup()
+
+        ctx.voice_client.play(source, after=after_playing)
+
+        embed = discord.Embed(
+            title="🎵 Spotify Connect đã bật",
+            description=(
+                f"**Device:** `{DEVICE_NAME}`\n"
+                f"**Bitrate:** {BITRATE} kbps\n\n"
+                "**Bước tiếp theo:**\n"
+                "1. Mở app Spotify (điện thoại/PC)\n"
+                "2. Bấm biểu tượng **Connect to a device** (góc dưới phải)\n"
+                f"3. Chọn **{DEVICE_NAME}**\n"
+                "4. Chọn bài → nhạc phát lên Discord 🎧"
+            ),
+            color=discord.Color.green()
+        )
+        if not os.path.exists(os.path.join(CACHE_DIR, "credentials.json")):
+            embed.add_field(
+                name="⚠️ Lần đầu chạy",
+                value="Terminal sẽ hiển thị link đăng nhập Spotify. Mở link và cấp quyền.",
+                inline=False
+            )
+        embed.set_footer(text="Dùng ?spotify-stop để tắt")
+        await ctx.send(embed=embed)
+
+        logger.info(f"[Spotify] {ctx.author} started in guild {ctx.guild.id}")
+
+    except Exception as e:
+        logger.error(f"[Spotify] Start error: {e}")
+        await ctx.send(f"❌ Lỗi khởi động: `{e}`")
+
+
+@bot.command(name="spotify-stop", aliases=["spotifystop", "sstop"])
+async def spotify_stop(ctx):
+    """Tắt Spotify Connect."""
+    if ctx.guild.id not in active_sources:
+        await ctx.send("❌ Spotify Connect chưa bật.")
+        return
+
+    src = active_sources.pop(ctx.guild.id)
+    src.cleanup()
+
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        ctx.voice_client.stop()
+
+    await ctx.send("⏹️ Đã tắt Spotify Connect.")
+
+
+@bot.command(name="spotify-status", aliases=["sstatus"])
+async def spotify_status(ctx):
+    """Xem trạng thái Spotify Connect."""
+    if ctx.guild.id not in active_sources:
+        await ctx.send("📭 Spotify Connect chưa bật.")
+        return
+
+    src = active_sources[ctx.guild.id]
+    running = src.running and (src.librespot and src.librespot.poll() is None)
+
+    embed = discord.Embed(
+        title="📊 Spotify Connect Status",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Device", value=f"`{DEVICE_NAME}`", inline=True)
+    embed.add_field(name="Bitrate", value=f"{BITRATE} kbps", inline=True)
+    embed.add_field(name="Running", value="✅" if running else "❌", inline=True)
+    embed.add_field(name="librespot PID", value=f"`{src.librespot.pid}`", inline=True)
+    embed.add_field(name="ffmpeg PID", value=f"`{src.ffmpeg.pid}`", inline=True)
+    embed.add_field(name="Buffer", value=f"{src.buffer.qsize()} frames", inline=True)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="help", aliases=["commands"])
+async def help_cmd(ctx):
+    """Hiển thị danh sách lệnh."""
     help_text = f"""
-🎵 **MUSIC BOT COMMANDS**
+🎵 **SPOTIFY CONNECT BOT**
 
-**🎧 PHÁT NHẠC:**
-`{PREFIX}play <bài/URL>` - Phát từ Spotify hoặc YouTube
-`{PREFIX}spotify <bài>` - Tìm kiếm trên Spotify
-`{PREFIX}pause` - Tạm dừng / Tiếp tục
-`{PREFIX}skip` - Bỏ qua bài hiện tại
-`{PREFIX}stop` - Dừng & xóa hàng đợi
+**🎧 VOICE:**
+`{DEFAULT_PREFIX}join` – Bot vào voice channel
+`{DEFAULT_PREFIX}leave` – Bot rời voice
 
-**🔗 HỖ TRỢ LINK:**
-- YouTube videos
-- Spotify tracks
-- Spotify playlists
-- Spotify albums
+**🎵 SPOTIFY CONNECT:**
+`{DEFAULT_PREFIX}spotify-start` – Bật Spotify Connect device
+`{DEFAULT_PREFIX}spotify-stop` – Tắt
+`{DEFAULT_PREFIX}spotify-status` – Trạng thái
 
-**📋 HÀNG ĐỢI:**
-`{PREFIX}queue` - Xem hàng đợi
-`{PREFIX}join` - Vào voice channel
-`{PREFIX}leave` - Rời voice channel
+**💡 CÁCH DÙNG:**
+1. Gõ `{DEFAULT_PREFIX}spotify-start`
+2. Mở app Spotify → **Connect to a device** → chọn **{DEVICE_NAME}**
+3. Chọn nhạc → phát lên Discord
 
-**💡 VÍ DỤ:**
-`{PREFIX}play Blinding Lights`
-`{PREFIX}play https://open.spotify.com/track/...`
-`{PREFIX}play https://open.spotify.com/playlist/...`
-`{PREFIX}play https://youtube.com/watch?v=...`
+**📌 YÊU CẦU:**
+• Spotify **Premium**
+• Đã cài **librespot** + **ffmpeg**
+
+**🔗 Lấy librespot:**
+https://github.com/librespot-org/librespot/releases
 """
     await ctx.send(help_text)
 
-# ===== RUN BOT =====
-if __name__ == "__main__":
+
+# =====================================================================
+# EVENTS
+# =====================================================================
+
+@bot.event
+async def on_ready():
+    print("=" * 60)
+    print(f"✅ Bot: {bot.user} | Prefix: {DEFAULT_PREFIX}")
+    print(f"🎵 Device name: {DEVICE_NAME}")
+    print(f"🎧 Bitrate: {BITRATE} kbps")
+    print(f"🔧 librespot: {LIBRESPOT_PATH or '❌ CHƯA CÀI'}")
+    print(f"👑 Admin IDs: {ADMIN_IDS}")
+    print("=" * 60)
+    print("💡 Gõ ?help trên Discord để xem lệnh")
+    print()
+
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Tự động dừng stream khi bot bị đẩy ra khỏi voice (không còn ai)."""
+    if before.channel and not after.channel:
+        vc = discord.utils.get(bot.voice_clients, guild=before.channel.guild)
+        if vc and len(vc.channel.members) == 1:
+            gid = before.channel.guild.id
+            src = active_sources.pop(gid, None)
+            if src:
+                src.cleanup()
+            await vc.disconnect()
+            logger.info(f"[VOICE] Bot tự rời guild {gid} (không còn ai)")
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        await ctx.send(f"❌ Lệnh không tồn tại. Dùng `{DEFAULT_PREFIX}help`.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"❌ Thiếu tham số. Dùng `{DEFAULT_PREFIX}help`.")
+    else:
+        logger.error(f"Command error: {error}")
+        await ctx.send(f"❌ Lỗi: {error}")
+
+
+# =====================================================================
+# MAIN
+# =====================================================================
+
+def main():
+    # Kiểm tra ffmpeg
+    if not shutil.which("ffmpeg"):
+        logger.warning("⚠️ Không tìm thấy ffmpeg trong PATH. Cài đặt và thêm vào PATH.")
+
+    # Cảnh báo librespot
+    if not LIBRESPOT_PATH:
+        logger.warning("⚠️ Không tìm thấy librespot. Tải tại:")
+        logger.warning("   https://github.com/librespot-org/librespot/releases")
+        logger.warning("   Đặt file librespot(.exe) cùng thư mục bot")
+
+    logger.info("🚀 Đang khởi động bot...")
     bot.run(DISCORD_TOKEN)
+
+
+if __name__ == "__main__":
+    main()
