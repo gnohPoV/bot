@@ -1,10 +1,3 @@
-Hiểu rồi! Bot mới = code mới hoàn toàn, chỉ slash commands, bao gồm cả Spotify Connect v0.1. Không prefix, không lệnh cũ.
-
----
-
-📄 File slash_bot.py – Spotify Connect Slash-Only
-
-```python
 """
 SPOTIFY CONNECT SLASH BOT
 ==========================
@@ -580,18 +573,3 @@ if __name__ == "__main__":
 
     logger.info("🚀 Đang khởi động bot...")
     bot.run(DISCORD_TOKEN)
-```
-
----
-
-📦 Setup
-
-1. Cài đặt
-
-```bash
-pip install discord.py
-```
-
-2. Tải librespot
-
-· Windows: https://github.com/librespot-org/librespot/releases → tải librespot.ex
